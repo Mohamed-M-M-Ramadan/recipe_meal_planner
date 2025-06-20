@@ -195,4 +195,18 @@ class Ingredient
             return [];
         }
     }
+
+        /**
+     * Finds an ingredient by its name.
+     *
+     * @param string $name The name of the ingredient to search for.
+     * @return array|null Returns associative array with ingredient data if found, or null if not found.
+     */
+    public function findIngredientByName($name) {
+        $pdo = getDbConnection();
+        $stmt = $pdo->prepare("SELECT * FROM ingredients WHERE name = :name LIMIT 1");
+        $stmt->execute([':name' => $name]);
+        $ingredient = $stmt->fetch(PDO::FETCH_ASSOC);
+        return $ingredient ? $ingredient : null;
+    }
 }

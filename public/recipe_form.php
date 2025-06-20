@@ -11,7 +11,7 @@ require_once '../app/classes/Ingredient.php'; // For ingredient lookup (though n
 // Instantiate services/models.
 $authService = new AuthService();
 $recipe = new Recipe(); // Used for findById
-//$recipeService = new RecipeService(); // Used for saving/updating with ingredients
+$recipeService = new RecipeService(); // Used for saving/updating with ingredients
 // $ingredient = new Ingredient(); // Not directly instantiated here, as RecipeService handles ingredient interaction
 
 // Ensure the user is logged in.

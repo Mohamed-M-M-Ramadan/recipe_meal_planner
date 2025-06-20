@@ -1,552 +1,366 @@
 <?php
-
-// Ensure the database connection function is available
+// Ensure this path is correct relative to Recipe.php
 require_once __DIR__ . '/../config/database.php';
 
-class Recipe
-{
-    private $pdo;
+class Recipe {
+    private $db; // Stores the database connection instance
+    private $table = 'recipes'; // Main table for recipes
+    private $recipeIngredientsTable = 'recipe_ingredients'; // Junction table for recipe-ingredient links
+    private $ingredientsTable = 'ingredients'; // Table for all unique ingredients
+    private $usersTable = 'users'; // Table for all users
 
-    public function __construct()
-    {
-        $this->pdo = getDbConnection();
+    public function __construct() {
+        // Get the database connection when the Recipe object is created
+        $this->db = Database::getInstance();
     }
 
     /**
-     * Finds a recipe by its ID.
+     * Finds a recipe by its primary key ID.
+     * Used to retrieve all details of a single recipe.
      *
-     * @param int $recipeId The ID of the recipe.
-     * @return array|false An associative array of recipe data if found, false otherwise.
+     * @param int $id The recipe_id to search for.
+     * @return array|false The recipe's data as an associative array, or false if not found.
      */
-    public function findById($recipeId)
-    {
-        try {
-            $stmt = $this->pdo->prepare("SELECT * FROM Recipes WHERE recipe_id = :recipe_id");
-            $stmt->execute(['recipe_id' => $recipeId]);
-            return $stmt->fetch();
-        } catch (PDOException $e) {
-            error_log("Error finding recipe by ID: " . $e->getMessage());
+    public function findById($id) {
+        $stmt = $this->db->prepare("SELECT * FROM " . $this->table . " WHERE recipe_id = ?");
+        // Check if prepare was successful
+        if ($stmt === false) {
+            error_log("Recipe::findById Prepare failed: " . $this->db->error);
             return false;
         }
+        $stmt->bind_param("i", $id);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $recipe = $result->fetch_assoc(); // Fetch the single row as an associative array
+        $stmt->close();
+        return $recipe;
     }
 
-    /**
-     * Retrieves recipes based on various filters.
-     * This method is designed to be flexible for fetching recipes for different views (public, user's own, admin).
+
+     /**
+     * Retrieves a list of recipes based on various criteria.
+     * Corrected to use positional placeholders for mysqli.
      *
-     * @param string|array|null $statusFilter Optional. A single status string ('public_approved', 'private', etc.),
-     * an array of status strings, or null for any status (admin only).
-     * @param int|null $userId Optional. Filter by user_id. Null to not filter by user.
-     * @param string|null $searchQuery Optional. A search term for recipe titles or descriptions.
-     * @param string $orderBy Optional. Column to order by (e.g., 'creation_date', 'title').
-     * @param string $orderDir Optional. Order direction ('ASC' or 'DESC').
-     * @param int|null $recipeId Optional. Filter by a specific recipe_id.
-     * @return array|false An array of recipe data, or false on error.
+     * @param string|null $status The status of recipes to retrieve (e.g., 'public_approved', 'private'). Null for any status.
+     * @param int|null $userId Optional: Filter by user ID.
+     * @param string|null $searchQuery Optional: Search by title or description.
+     * @param string $orderBy Column to order by (e.g., 'creation_date', 'title').
+     * @param string $orderDir Order direction ('ASC' or 'DESC').
+     * @param int $limit Max number of results.
+     * @param int $offset Starting offset for results.
+     * @return array An array of recipe data.
      */
-    public function getRecipes(
-        $statusFilter = null,
-        $userId = null,
-        $searchQuery = null,
-        $orderBy = 'creation_date',
-        $orderDir = 'DESC',
-        $recipeId = null
-    ) {
-        $sql = "SELECT r.*, u.username, c.category_name
-                FROM Recipes r
-                JOIN Users u ON r.user_id = u.user_id
-                LEFT JOIN Categories c ON r.category_id = c.category_id";
-        $conditions = [];
-        $params = [];
+    public function getRecipes($status = null, $userId = null, $searchQuery = null, $orderBy = 'creation_date', $orderDir = 'DESC', $limit = 20, $offset = 0) {
+        // Base query
+        $query = "SELECT r.*, u.username FROM " . $this->table . " r JOIN " . $this->usersTable . " u ON r.user_id = u.user_id WHERE 1=1";
+        $params = []; // To store parameters for binding
+        $types = ""; // To store types for binding (e.g., 's' for string, 'i' for integer)
 
-        if ($recipeId !== null) {
-            $conditions[] = "r.recipe_id = :recipe_id";
-            $params[':recipe_id'] = $recipeId;
+        // Add status filter if provided
+        if ($status !== null) {
+            $query .= " AND r.status = ?";
+            $params[] = $status;
+            $types .= "s";
         }
 
-        if ($statusFilter !== null) {
-            if (is_array($statusFilter)) {
-                // Handle array of statuses using IN clause
-                $placeholders = [];
-                foreach ($statusFilter as $index => $status) {
-                    $placeholder = ":status_" . $index;
-                    $placeholders[] = $placeholder;
-                    $params[$placeholder] = $status;
-                }
-                $conditions[] = "r.status IN (" . implode(', ', $placeholders) . ")";
-            } else {
-                // Handle single status string
-                $conditions[] = "r.status = :status_filter";
-                $params[':status_filter'] = $statusFilter;
-            }
-        }
-
+        // Add user ID filter if provided
         if ($userId !== null) {
-            $conditions[] = "r.user_id = :user_id";
-            $params[':user_id'] = $userId;
+            $query .= " AND r.user_id = ?";
+            $params[] = $userId;
+            $types .= "i";
         }
 
+        // Add search query filter if provided
         if ($searchQuery !== null) {
-            $conditions[] = "(r.title LIKE :search_query OR r.description LIKE :search_query)";
-            $params[':search_query'] = '%' . $searchQuery . '%';
+            $query .= " AND (r.title LIKE ? OR r.description LIKE ?)";
+            $params[] = '%' . $searchQuery . '%';
+            $params[] = '%' . $searchQuery . '%';
+            $types .= "ss"; // Two string parameters for the two LIKE clauses
         }
 
-        if (!empty($conditions)) {
-            $sql .= " WHERE " . implode(' AND ', $conditions);
-        }
-
-        // Basic validation for orderBy and orderDir
+        // Add ordering
+        // Sanitize orderBy and orderDir to prevent SQL injection
         $allowedOrderBy = ['creation_date', 'title', 'prep_time', 'cook_time', 'servings'];
         if (!in_array($orderBy, $allowedOrderBy)) {
-            $orderBy = 'creation_date'; // Default to safe value
+            $orderBy = 'creation_date'; // Default if invalid
         }
         $orderDir = (strtoupper($orderDir) === 'ASC') ? 'ASC' : 'DESC';
 
-        $sql .= " ORDER BY " . $orderBy . " " . $orderDir;
+        $query .= " ORDER BY r." . $orderBy . " " . $orderDir;
 
-        // If fetching a single recipe by ID, ensure LIMIT 1
-        if ($recipeId !== null) {
-            $sql .= " LIMIT 1";
+        // Add LIMIT and OFFSET for pagination
+        $query .= " LIMIT ? OFFSET ?";
+        $params[] = $limit;
+        $params[] = $offset;
+        $types .= "ii";
+
+        $stmt = $this->db->prepare($query);
+
+        if ($stmt === false) {
+            error_log("Recipe::getRecipes Prepare failed: " . $this->db->error);
+            return []; // Return empty array on prepare failure
         }
 
-
-        try {
-            $stmt = $this->pdo->prepare($sql);
-            $stmt->execute($params);
-            return $stmt->fetchAll();
-        } catch (PDOException $e) {
-            error_log("Error fetching recipes: " . $e->getMessage());
-            return false;
+        // Dynamically bind parameters
+        if (!empty($params)) {
+            // Use call_user_func_array to bind parameters as bind_param requires
+            // parameters to be passed by reference, and $params contains values
+            // Create an array of references for bind_param
+            $bindArgs = [$types];
+            foreach ($params as $key => $value) {
+                $bindArgs[] = &$params[$key]; // Pass by reference
+            }
+            call_user_func_array([$stmt, 'bind_param'], $bindArgs);
         }
+
+        if (!$stmt->execute()) {
+            error_log("Recipe::getRecipes Execute failed: " . $stmt->error);
+            $stmt->close();
+            return []; // Return empty array on execute failure
+        }
+
+        $result = $stmt->get_result();
+        $recipes = $result->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+
+        return $recipes;
     }
 
 
+
     /**
-     * Creates a new recipe and its associated ingredients.
+     * Creates a new recipe entry in the 'recipes' table.
+     * This is the method that `RecipeService::saveRecipeWithIngredients` calls.
      *
-     * @param int $userId The ID of the user creating the recipe.
-     * @param string $title The recipe title.
-     * @param string $description The recipe description.
-     * @param string $instructions The recipe instructions.
+     * @param int $userId The ID of the user who owns this recipe.
+     * @param string $title The title of the recipe.
+     * @param string $description A short description of the recipe.
+     * @param string $instructions Detailed cooking instructions.
      * @param int $prepTime Preparation time in minutes.
-     * @param int $cookTime Cook time in minutes.
-     * @param int $servings Number of servings.
-     * @param string $status The visibility status ('private', 'public_pending').
-     * @param string|null $imagePath Path to the recipe image.
-     * @param int|null $categoryId The ID of the category.
-     * @param array $ingredients An array of ingredient data [{quantity, unit, name}, ...].
-     * @return array An associative array with 'success' (boolean) and 'message' (string), and 'recipe_id'.
+     * @param int $cookTime Cooking time in minutes.
+     * @param int $servings Number of servings the recipe yields.
+     * @param string $status The visibility status (e.g., 'private', 'public_pending').
+     * @param string|null $imagePath Optional: file path to the recipe's image.
+     * @param int|null $categoryId Optional: ID of the recipe's category.
+     * @return array Result array with 'success' (boolean) and 'message' (string),
+     * and 'recipe_id' if successful.
      */
-    public function createRecipe(
-        $userId,
-        $title,
-        $description,
-        $instructions,
-        $prepTime,
-        $cookTime,
-        $servings,
-        $status,
-        $imagePath,
-        $categoryId,
-        $ingredients // This is an array of ingredient details
-    ) {
-        if (empty($title) || empty($instructions) || empty($prepTime) || empty($cookTime) || empty($servings) || empty($status) || empty($ingredients)) {
-            return ['success' => false, 'message' => 'Please fill in all required recipe fields and add at least one ingredient.'];
+    public function createRecipe($userId, $title, $description, $instructions, $prepTime, $cookTime, $servings, $status, $imagePath = null, $categoryId = null) {
+        $query = "INSERT INTO " . $this->table . " (user_id, title, description, instructions, prep_time, cook_time, servings, status, image_path, category_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        $stmt = $this->db->prepare($query);
+
+        if ($stmt === false) {
+            return ['success' => false, 'message' => 'Prepare failed: ' . $this->db->error];
         }
 
-        try {
-            $this->pdo->beginTransaction();
+        // 'isssiiisss' defines the types of the parameters:
+        // i = integer, s = string
+        // user_id (i), title (s), description (s), instructions (s),
+        // prep_time (i), cook_time (i), servings (i), status (s),
+        // image_path (s), category_id (s - bind as string, DB will convert or null)
+        $stmt->bind_param("isssiiisss", $userId, $title, $description, $instructions, $prepTime, $cookTime, $servings, $status, $imagePath, $categoryId);
 
-            // 1. Insert into Recipes table
-            $stmt = $this->pdo->prepare("INSERT INTO Recipes (user_id, category_id, title, description, instructions, prep_time, cook_time, servings, image_path, status, creation_date) VALUES (:user_id, :category_id, :title, :description, :instructions, :prep_time, :cook_time, :servings, :image_path, :status, NOW())");
-            $recipeSuccess = $stmt->execute([
-                'user_id' => $userId,
-                'category_id' => $categoryId,
-                'title' => $title,
-                'description' => $description,
-                'instructions' => $instructions,
-                'prep_time' => $prepTime,
-                'cook_time' => $cookTime,
-                'servings' => $servings,
-                'image_path' => $imagePath,
-                'status' => $status
-            ]);
-
-            if (!$recipeSuccess) {
-                $this->pdo->rollBack();
-                return ['success' => false, 'message' => 'Failed to create recipe.'];
-            }
-
-            $recipeId = $this->pdo->lastInsertId();
-
-            // 2. Insert into RecipeIngredients table
-            $ingredientStmt = $this->pdo->prepare("INSERT INTO RecipeIngredients (recipe_id, ingredient_id, quantity, unit, custom_ingredient_name) VALUES (:recipe_id, :ingredient_id, :quantity, :unit, :custom_ingredient_name)");
-
-            foreach ($ingredients as $ing) {
-                $ingredientId = $ing['ingredient_id'] ?? null;
-                $ingredientName = $ing['ingredient_name'] ?? ''; // This is the user-typed name
-                $quantity = $ing['quantity'] ?? '';
-                $unit = $ing['unit'] ?? '';
-
-                // If ingredient_id is not provided (meaning it's a new ingredient),
-                // check if it exists in Ingredients table or create it.
-                if (empty($ingredientId) && !empty($ingredientName)) {
-                    $existingIngredient = $this->getIngredientIdByName($ingredientName);
-                    if ($existingIngredient) {
-                        $ingredientId = $existingIngredient['ingredient_id'];
-                    } else {
-                        // Create new ingredient if it doesn't exist
-                        $newIngredientStmt = $this->pdo->prepare("INSERT INTO Ingredients (ingredient_name) VALUES (:ingredient_name)");
-                        $newIngredientStmt->execute(['ingredient_name' => $ingredientName]);
-                        $ingredientId = $this->pdo->lastInsertId();
-                    }
-                }
-
-                if (empty($ingredientId) && empty($ingredientName)) {
-                     $this->pdo->rollBack();
-                     return ['success' => false, 'message' => 'An ingredient name is missing.'];
-                }
-
-                // If ingredientId is still null, but ingredientName is present, we use custom_ingredient_name
-                // Otherwise, ingredientId implies we use the linked ingredient_name from Ingredients table
-                $customIngredientName = null;
-                if (empty($ingredientId)) {
-                    $customIngredientName = $ingredientName; // Use user-typed name as custom
-                }
-
-
-                $ingSuccess = $ingredientStmt->execute([
-                    'recipe_id' => $recipeId,
-                    'ingredient_id' => $ingredientId, // Will be null if using custom_ingredient_name
-                    'quantity' => $quantity,
-                    'unit' => $unit,
-                    'custom_ingredient_name' => $customIngredientName // Store custom name here
-                ]);
-
-                if (!$ingSuccess) {
-                    $this->pdo->rollBack();
-                    return ['success' => false, 'message' => 'Failed to add ingredient: ' . $ingredientName];
-                }
-            }
-
-            $this->pdo->commit();
-            return [
-                'success' => true,
-                'message' => 'Recipe created successfully!',
-                'recipe_id' => $recipeId
-            ];
-
-        } catch (PDOException $e) {
-            $this->pdo->rollBack();
-            error_log("Error creating recipe: " . $e->getMessage());
-            return ['success' => false, 'message' => 'Failed to create recipe: ' . $e->getMessage()];
+        if ($stmt->execute()) {
+            $recipeId = $this->db->insert_id; // Get the ID of the newly inserted recipe
+            $stmt->close();
+            return ['success' => true, 'recipe_id' => $recipeId, 'message' => 'Recipe created successfully.'];
+        } else {
+            $error = $stmt->error;
+            $stmt->close();
+            error_log("Recipe::createRecipe Execution failed: " . $error);
+            return ['success' => false, 'message' => 'Execution failed: ' . $error];
         }
     }
 
-
     /**
-     * Updates an existing recipe and its associated ingredients.
+     * Updates an existing recipe entry in the 'recipes' table.
+     * This is the method that `RecipeService::updateRecipeWithIngredients` calls.
      *
      * @param int $recipeId The ID of the recipe to update.
-     * @param int $userId The ID of the user updating the recipe (for ownership check).
-     * @param string $title The recipe title.
-     * @param string $description The recipe description.
-     * @param string $instructions The recipe instructions.
+     * @param string $title Recipe title.
+     * @param string $description Recipe description.
+     * @param string $instructions Cooking instructions.
      * @param int $prepTime Preparation time in minutes.
      * @param int $cookTime Cook time in minutes.
      * @param int $servings Number of servings.
-     * @param string $status The visibility status ('private', 'public_pending').
+     * @param string $status Recipe status ('private', 'public_pending', etc.).
      * @param string|null $imagePath Path to the recipe image.
-     * @param int|null $categoryId The ID of the category.
-     * @param array $ingredients An array of ingredient data [{quantity, unit, name}, ...].
-     * @return array An associative array with 'success' (boolean) and 'message' (string).
+     * @param int|null $categoryId Optional category ID.
+     * @return array Result array with 'success'.
      */
-    public function updateRecipe(
-        $recipeId,
-        $userId,
-        $title,
-        $description,
-        $instructions,
-        $prepTime,
-        $cookTime,
-        $servings,
-        $status,
-        $imagePath,
-        $categoryId,
-        $ingredients
-    ) {
-        if (empty($title) || empty($instructions) || empty($prepTime) || empty($cookTime) || empty($servings) || empty($status) || empty($ingredients)) {
-            return ['success' => false, 'message' => 'Please fill in all required recipe fields and add at least one ingredient.'];
+    public function updateRecipe($recipeId, $title, $description, $instructions, $prepTime, $cookTime, $servings, $status, $imagePath = null, $categoryId = null) {
+        $query = "UPDATE " . $this->table . " SET title = ?, description = ?, instructions = ?, prep_time = ?, cook_time = ?, servings = ?, status = ?, image_path = ?, category_id = ? WHERE recipe_id = ?";
+        $stmt = $this->db->prepare($query);
+
+        if ($stmt === false) {
+            return ['success' => false, 'message' => 'Prepare failed: ' . $this->db->error];
         }
 
-        try {
-            $this->pdo->beginTransaction();
+        // 'sssiissssi' defines the types of the parameters for update:
+        // title (s), description (s), instructions (s), prep_time (i),
+        // cook_time (i), servings (i), status (s), image_path (s),
+        // category_id (s), recipe_id (i)
+        $stmt->bind_param("sssiissssi", $title, $description, $instructions, $prepTime, $cookTime, $servings, $status, $imagePath, $categoryId, $recipeId);
 
-            // 1. Update Recipes table
-            // Only allow updating status to 'public_pending' if it's currently 'private'
-            // Or if it's 'public_approved', 'public_pending', 'public_rejected' keep it as is unless admin changes it.
-            // For now, allow direct update of status. Admin will handle final approval.
-            $stmt = $this->pdo->prepare("UPDATE Recipes SET
-                category_id = :category_id,
-                title = :title,
-                description = :description,
-                instructions = :instructions,
-                prep_time = :prep_time,
-                cook_time = :cook_time,
-                servings = :servings,
-                image_path = :image_path,
-                status = :status,
-                last_updated = NOW()
-                WHERE recipe_id = :recipe_id AND user_id = :user_id"); // Ensure user can only update their own recipes
-
-            $recipeSuccess = $stmt->execute([
-                'category_id' => $categoryId,
-                'title' => $title,
-                'description' => $description,
-                'instructions' => $instructions,
-                'prep_time' => $prepTime,
-                'cook_time' => $cookTime,
-                'servings' => $servings,
-                'image_path' => $imagePath,
-                'status' => $status,
-                'recipe_id' => $recipeId,
-                'user_id' => $userId
-            ]);
-
-            if ($stmt->rowCount() === 0) {
-                 // This means either the recipe_id didn't exist or it didn't belong to the user_id
-                $this->pdo->rollBack();
-                return ['success' => false, 'message' => 'Recipe not found or you do not have permission to edit it.'];
-            }
-
-            // 2. Update RecipeIngredients: Delete existing and re-insert new ones
-            $deleteStmt = $this->pdo->prepare("DELETE FROM RecipeIngredients WHERE recipe_id = :recipe_id");
-            $deleteStmt->execute(['recipe_id' => $recipeId]);
-
-            $ingredientStmt = $this->pdo->prepare("INSERT INTO RecipeIngredients (recipe_id, ingredient_id, quantity, unit, custom_ingredient_name) VALUES (:recipe_id, :ingredient_id, :quantity, :unit, :custom_ingredient_name)");
-
-            foreach ($ingredients as $ing) {
-                $ingredientId = $ing['ingredient_id'] ?? null;
-                $ingredientName = $ing['ingredient_name'] ?? '';
-                $quantity = $ing['quantity'] ?? '';
-                $unit = $ing['unit'] ?? '';
-
-                 if (empty($ingredientId) && !empty($ingredientName)) {
-                    $existingIngredient = $this->getIngredientIdByName($ingredientName);
-                    if ($existingIngredient) {
-                        $ingredientId = $existingIngredient['ingredient_id'];
-                    } else {
-                        // Create new ingredient if it doesn't exist
-                        $newIngredientStmt = $this->pdo->prepare("INSERT INTO Ingredients (ingredient_name) VALUES (:ingredient_name)");
-                        $newIngredientStmt->execute(['ingredient_name' => $ingredientName]);
-                        $ingredientId = $this->pdo->lastInsertId();
-                    }
-                }
-
-                if (empty($ingredientId) && empty($ingredientName)) {
-                     $this->pdo->rollBack();
-                     return ['success' => false, 'message' => 'An ingredient name is missing.'];
-                }
-
-                $customIngredientName = null;
-                if (empty($ingredientId)) {
-                    $customIngredientName = $ingredientName;
-                }
-
-                $ingSuccess = $ingredientStmt->execute([
-                    'recipe_id' => $recipeId,
-                    'ingredient_id' => $ingredientId,
-                    'quantity' => $quantity,
-                    'unit' => $unit,
-                    'custom_ingredient_name' => $customIngredientName
-                ]);
-
-                if (!$ingSuccess) {
-                    $this->pdo->rollBack();
-                    return ['success' => false, 'message' => 'Failed to update ingredient: ' . $ingredientName];
-                }
-            }
-
-            $this->pdo->commit();
-            return ['success' => true, 'message' => 'Recipe updated successfully!'];
-
-        } catch (PDOException $e) {
-            $this->pdo->rollBack();
-            error_log("Error updating recipe: " . $e->getMessage());
-            return ['success' => false, 'message' => 'Failed to update recipe: ' . $e->getMessage()];
+        if ($stmt->execute()) {
+            $stmt->close();
+            return ['success' => true, 'message' => 'Recipe updated successfully.'];
+        } else {
+            $error = $stmt->error;
+            $stmt->close();
+            error_log("Recipe::updateRecipe Execution failed: " . $error);
+            return ['success' => false, 'message' => 'Execution failed: ' . $error];
         }
     }
 
     /**
-     * Deletes a recipe by its ID. (Admin or owner functionality)
+     * Deletes a recipe and all its associated ingredient links.
+     * Uses a transaction to ensure both operations succeed or fail together.
      *
-     * @param int $recipeId The ID of the recipe to delete.
-     * @param int|null $userId Optional. The ID of the user attempting to delete (for ownership check).
-     * @param bool $isAdmin Optional. True if the user is an admin.
-     * @return array An associative array with 'success' (boolean) and 'message' (string).
+     * @param int $id The recipe_id to delete.
+     * @return array Result array with 'success' (boolean) and 'message' (string).
      */
-    public function deleteRecipe($recipeId, $userId = null, $isAdmin = false)
-    {
+    public function deleteRecipe($id) {
+        // Start transaction for atomicity
+        $this->db->begin_transaction();
         try {
-            $this->pdo->beginTransaction();
-
-            // Get recipe details to verify ownership if not admin
-            $stmt = $this->pdo->prepare("SELECT user_id FROM Recipes WHERE recipe_id = :recipe_id");
-            $stmt->execute(['recipe_id' => $recipeId]);
-            $recipe = $stmt->fetch();
-
-            if (!$recipe) {
-                $this->pdo->rollBack();
-                return ['success' => false, 'message' => 'Recipe not found.'];
+            // First, remove associated ingredients from recipe_ingredients table
+            $stmt = $this->db->prepare("DELETE FROM " . $this->recipeIngredientsTable . " WHERE recipe_id = ?");
+            if ($stmt === false) {
+                throw new Exception('Prepare failed for deleting recipe ingredients: ' . $this->db->error);
             }
-
-            // Check if user is owner or admin
-            if (!$isAdmin && $recipe['user_id'] != $userId) {
-                $this->pdo->rollBack();
-                return ['success' => false, 'message' => 'You do not have permission to delete this recipe.'];
+            $stmt->bind_param("i", $id);
+            if (!$stmt->execute()) {
+                throw new Exception('Execution failed for deleting recipe ingredients: ' . $stmt->error);
             }
+            $stmt->close();
 
-            // 1. Delete associated ingredients first (due to foreign key constraint)
-            $deleteIngredientsStmt = $this->pdo->prepare("DELETE FROM RecipeIngredients WHERE recipe_id = :recipe_id");
-            $deleteIngredientsStmt->execute(['recipe_id' => $recipeId]);
-
-            // 2. Delete the recipe
-            $deleteRecipeStmt = $this->pdo->prepare("DELETE FROM Recipes WHERE recipe_id = :recipe_id");
-            $success = $deleteRecipeStmt->execute(['recipe_id' => $recipeId]);
-
-            if ($success) {
-                $this->pdo->commit();
-                return ['success' => true, 'message' => 'Recipe deleted successfully.'];
+            // Then, delete the recipe itself from the 'recipes' table
+            $stmt = $this->db->prepare("DELETE FROM " . $this->table . " WHERE recipe_id = ?");
+            if ($stmt === false) {
+                throw new Exception('Prepare failed for deleting recipe: ' . $this->db->error);
+            }
+            $stmt->bind_param("i", $id);
+            if ($stmt->execute()) {
+                $this->db->commit(); // Commit if both deletions are successful
+                $stmt->close();
+                return ['success' => true, 'message' => 'Recipe and its ingredients deleted successfully.'];
             } else {
-                $this->pdo->rollBack();
-                return ['success' => false, 'message' => 'Failed to delete recipe.'];
+                throw new Exception('Execution failed for deleting recipe: ' . $stmt->error);
             }
-
-        } catch (PDOException $e) {
-            $this->pdo->rollBack();
+        } catch (Exception $e) {
+            $this->db->rollback(); // Rollback on any error
             error_log("Error deleting recipe: " . $e->getMessage());
-            return ['success' => false, 'message' => 'An error occurred: ' . $e->getMessage()];
-        }
-    }
-
-
-    /**
-     * Approves a pending recipe (Admin functionality).
-     *
-     * @param int $recipeId The ID of the recipe to approve.
-     * @return array An associative array with 'success' (boolean) and 'message' (string).
-     */
-    public function approveRecipe($recipeId)
-    {
-        try {
-            $stmt = $this->pdo->prepare("UPDATE Recipes SET status = 'public_approved', last_updated = NOW() WHERE recipe_id = :recipe_id AND status = 'public_pending'");
-            $success = $stmt->execute(['recipe_id' => $recipeId]);
-
-            return ['success' => $success, 'message' => $success ? 'Recipe approved successfully.' : 'Failed to approve recipe (might not be pending or not found).'];
-        } catch (PDOException $e) {
-            error_log("Error approving recipe: " . $e->getMessage());
-            return ['success' => false, 'message' => 'An error occurred: ' . $e->getMessage()];
+            return ['success' => false, 'message' => 'Failed to delete recipe: ' . $e->getMessage()];
         }
     }
 
     /**
-     * Rejects a pending recipe (Admin functionality).
-     *
-     * @param int $recipeId The ID of the recipe to reject.
-     * @return array An associative array with 'success' (boolean) and 'message' (string).
-     */
-    public function rejectRecipe($recipeId)
-    {
-        try {
-            $stmt = $this->pdo->prepare("UPDATE Recipes SET status = 'public_rejected', last_updated = NOW() WHERE recipe_id = :recipe_id AND status = 'public_pending'");
-            $success = $stmt->execute(['recipe_id' => $recipeId]);
-
-            return ['success' => $success, 'message' => $success ? 'Recipe rejected successfully.' : 'Failed to reject recipe (might not be pending or not found).'];
-        } catch (PDOException $e) {
-            error_log("Error rejecting recipe: " . $e->getMessage());
-            return ['success' => false, 'message' => 'An error occurred: ' . $e->getMessage()];
-        }
-    }
-
-    /**
-     * Changes a recipe's status to private (Admin functionality).
-     *
-     * @param int $recipeId The ID of the recipe to set private.
-     * @return array An associative array with 'success' (boolean) and 'message' (string).
-     */
-    public function makeRecipePrivate($recipeId)
-    {
-        try {
-            $stmt = $this->pdo->prepare("UPDATE Recipes SET status = 'private', last_updated = NOW() WHERE recipe_id = :recipe_id");
-            $success = $stmt->execute(['recipe_id' => $recipeId]);
-
-            return ['success' => $success, 'message' => $success ? 'Recipe set to private successfully.' : 'Failed to set recipe to private.'];
-        } catch (PDOException $e) {
-            error_log("Error making recipe private: " . $e->getMessage());
-            return ['success' => false, 'message' => 'An error occurred: ' . $e->getMessage()];
-        }
-    }
-
-
-    /**
-     * Retrieves ingredients associated with a specific recipe.
+     * Adds an ingredient link to a specific recipe in the 'recipe_ingredients' table.
+     * This is called by `RecipeService` when saving/updating recipes.
      *
      * @param int $recipeId The ID of the recipe.
-     * @return array An array of ingredient data.
+     * @param int $ingredientId The ID of the ingredient.
+     * @param string $quantity The quantity (e.g., "1 cup", "200g").
+     * @param string $unit The unit of measurement (e.g., "cup", "g", "tsp").
+     * @return array Result array with 'success' (boolean) and 'message' (string).
      */
-    public function getIngredientsForRecipe($recipeId)
-    {
-        try {
-            $stmt = $this->pdo->prepare("
-                SELECT ri.quantity, ri.unit, COALESCE(i.ingredient_name, ri.custom_ingredient_name) AS ingredient_name
-                FROM RecipeIngredients ri
-                LEFT JOIN Ingredients i ON ri.ingredient_id = i.ingredient_id
-                WHERE ri.recipe_id = :recipe_id
-            ");
-            $stmt->execute(['recipe_id' => $recipeId]);
-            return $stmt->fetchAll();
-        } catch (PDOException $e) {
-            error_log("Error getting ingredients for recipe: " . $e->getMessage());
-            return [];
+    public function addIngredientToRecipe($recipeId, $ingredientId, $quantity, $unit) {
+        $query = "INSERT INTO " . $this->recipeIngredientsTable . " (recipe_id, ingredient_id, quantity, unit) VALUES (?, ?, ?, ?)";
+        $stmt = $this->db->prepare($query);
+
+        if ($stmt === false) {
+            return ['success' => false, 'message' => 'Prepare failed: ' . $this->db->error];
+        }
+
+        $stmt->bind_param("iiss", $recipeId, $ingredientId, $quantity, $unit);
+
+        if ($stmt->execute()) {
+            $stmt->close();
+            return ['success' => true, 'message' => 'Ingredient added to recipe.'];
+        } else {
+            $error = $stmt->error;
+            $stmt->close();
+            error_log("Recipe::addIngredientToRecipe Execution failed: " . $error);
+            return ['success' => false, 'message' => 'Execution failed: ' . $error];
         }
     }
 
     /**
-     * Helper method to get ingredient ID by name.
+     * Removes all ingredient links for a given recipe from the 'recipe_ingredients' table.
+     * This is used by `RecipeService` before re-adding updated ingredients during an edit.
      *
-     * @param string $ingredientName
-     * @return array|false
+     * @param int $recipeId The ID of the recipe.
+     * @return array Result array with 'success' (boolean) and 'message' (string).
      */
-    private function getIngredientIdByName($ingredientName)
-    {
-        try {
-            $stmt = $this->pdo->prepare("SELECT ingredient_id FROM Ingredients WHERE ingredient_name = :ingredient_name");
-            $stmt->execute(['ingredient_name' => $ingredientName]);
-            return $stmt->fetch();
-        } catch (PDOException $e) {
-            error_log("Error getting ingredient by name: " . $e->getMessage());
-            return false;
+    public function removeAllIngredientsFromRecipe($recipeId) {
+        $query = "DELETE FROM " . $this->recipeIngredientsTable . " WHERE recipe_id = ?";
+        $stmt = $this->db->prepare($query);
+
+        if ($stmt === false) {
+            return ['success' => false, 'message' => 'Prepare failed: ' . $this->db->error];
+        }
+
+        $stmt->bind_param("i", $recipeId);
+
+        if ($stmt->execute()) {
+            $stmt->close();
+            return ['success' => true, 'message' => 'All ingredients removed from recipe.'];
+        } else {
+            $error = $stmt->error;
+            $stmt->close();
+            error_log("Recipe::removeAllIngredientsFromRecipe Execution failed: " . $error);
+            return ['success' => false, 'message' => 'Execution failed: ' . $error];
         }
     }
 
-/**
- * Update the status of a recipe by its ID.
- * @param int $recipeId
- * @param string $newStatus
- * @return bool
- */
-public function updateRecipeStatus($recipeId, $newStatus)
-{
-    // Allowed statuses
-    $allowedStatuses = ['private', 'public_pending', 'public_approved'];
-    if (!in_array($newStatus, $allowedStatuses, true)) {
-        return false;
+    /**
+     * Retrieves all ingredients and their details for a specific recipe.
+     * This is called by `RecipeService::getRecipeIngredients`.
+     *
+     * @param int $recipeId The ID of the recipe.
+     * @return array An array of ingredient data (ingredient_id, name, quantity, unit).
+     */
+    public function getIngredientsForRecipe($recipeId) {
+        $query = "SELECT ri.quantity, ri.unit, i.ingredient_id, i.ingredient_name
+                  FROM " . $this->recipeIngredientsTable . " ri
+                  JOIN " . $this->ingredientsTable . " i ON ri.ingredient_id = i.ingredient_id
+                  WHERE ri.recipe_id = ?";
+        $stmt = $this->db->prepare($query);
+
+        if ($stmt === false) {
+            error_log('Prepare failed in getIngredientsForRecipe: ' . $this->db->error);
+            return []; // Return empty array on error
+        }
+
+        $stmt->bind_param("i", $recipeId);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $ingredients = $result->fetch_all(MYSQLI_ASSOC); // Fetch all rows as associative arrays
+        $stmt->close();
+        return $ingredients;
     }
 
-    $stmt = $this->pdo->prepare("UPDATE Recipes SET status = :status WHERE recipe_id = :id");
-    return $stmt->execute([
-        ':status' => $newStatus,
-        ':id' => $recipeId
-    ]);
-}
+    /**
+     * Update the status of a recipe by its ID.
+     *
+     * @param int $recipeId
+     * @param string $newStatus
+     * @return bool
+     */
+    public function updateRecipeStatus($recipeId, $newStatus)
+    {
+        // Define allowed statuses
+        $allowedStatuses = ['private', 'public_pending', 'public_approved'];
+        if (!in_array($newStatus, $allowedStatuses, true)) {
+            return false;
+        }
 
+        // Assuming you have a PDO connection as $this->db
+        $stmt = $this->db->prepare("UPDATE recipes SET status = :status WHERE recipe_id = :id");
+        return $stmt->execute([
+            ':status' => $newStatus,
+            ':id' => $recipeId
+        ]);
+    }
 }
